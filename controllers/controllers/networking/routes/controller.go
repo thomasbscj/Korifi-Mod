@@ -19,6 +19,7 @@ package routes
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	korifiv1alpha1 "code.cloudfoundry.org/korifi/controllers/api/v1alpha1"
@@ -71,7 +72,6 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) *builder.Builder {
 
 func (r *Reconciler) enqueueCFAppRequests(ctx context.Context, o client.Object) []reconcile.Request {
 	var requests []reconcile.Request
-
 	cfApp, ok := o.(*korifiv1alpha1.CFApp)
 	if !ok {
 		return []reconcile.Request{}
@@ -108,6 +108,9 @@ func (r *Reconciler) enqueueCFAppRequests(ctx context.Context, o client.Object) 
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes/status,verbs=get
 
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+//+kubebuilder:rbac:groups=korifi.cloudfoundry.org,resources=cfspaces,verbs=get;list;watch
+//+kubebuilder:rbac:groups=korifi.cloudfoundry.org,resources=cforgs,verbs=get;list;watch
 
 func (r *Reconciler) ReconcileResource(ctx context.Context, cfRoute *korifiv1alpha1.CFRoute) (ctrl.Result, error) {
 	log := logr.FromContextOrDiscard(ctx)
@@ -124,8 +127,20 @@ func (r *Reconciler) ReconcileResource(ctx context.Context, cfRoute *korifiv1alp
 		return ctrl.Result{}, err
 	}
 
+	// Buscar CFSpace que controla este namespace
+	cfSpace, err := r.getCFSpaceForNamespace(ctx, cfRoute.Namespace)
+	if err != nil {
+		return ctrl.Result{}, k8s.NewNotReadyError().WithCause(err).WithReason("CFSpaceNotFound")
+	}
+
+	// Buscar CFOrg - assumindo que está no mesmo namespace que o space ou usando o namespace do space
+	cfOrg, err := r.getCFOrgForSpace(ctx, cfSpace)
+	if err != nil {
+		return ctrl.Result{}, k8s.NewNotReadyError().WithCause(err).WithReason("CFOrgNotFound")
+	}
+
 	cfDomain := &korifiv1alpha1.CFDomain{}
-	err := r.client.Get(ctx, types.NamespacedName{Name: cfRoute.Spec.DomainRef.Name, Namespace: cfRoute.Spec.DomainRef.Namespace}, cfDomain)
+	err = r.client.Get(ctx, types.NamespacedName{Name: cfRoute.Spec.DomainRef.Name, Namespace: cfRoute.Spec.DomainRef.Namespace}, cfDomain)
 	if err != nil {
 		return ctrl.Result{}, k8s.NewNotReadyError().WithCause(err).WithReason("InvalidDomainRef")
 	}
@@ -135,12 +150,12 @@ func (r *Reconciler) ReconcileResource(ctx context.Context, cfRoute *korifiv1alp
 		return ctrl.Result{}, k8s.NewNotReadyError().WithCause(err).WithReason("CreatePatchServices")
 	}
 
-	err = r.reconcileHTTPRoute(ctx, cfRoute, cfDomain)
+	err = r.reconcileHTTPRoute(ctx, cfRoute, cfDomain, cfSpace, cfOrg)
 	if err != nil {
 		return ctrl.Result{}, k8s.NewNotReadyError().WithCause(err).WithReason("ReconcileHTTPRoute")
 	}
 
-	fqdn := buildFQDN(cfRoute, cfDomain)
+	fqdn := r.buildFQDN(cfRoute, cfDomain, cfSpace, cfOrg)
 	cfRoute.Status.FQDN = fqdn
 	cfRoute.Status.URI = fqdn + cfRoute.Spec.Path
 
@@ -158,6 +173,155 @@ func (r *Reconciler) ReconcileResource(ctx context.Context, cfRoute *korifiv1alp
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// getCFSpaceForNamespace encontra o CFSpace que corresponde ao namespace dado
+func (r *Reconciler) getCFSpaceForNamespace(ctx context.Context, namespace string) (*korifiv1alpha1.CFSpace, error) {
+	// Método 1: Buscar por annotations/labels no namespace
+	k8sNamespace := &corev1.Namespace{}
+	err := r.client.Get(ctx, types.NamespacedName{Name: namespace}, k8sNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get namespace %s: %w", namespace, err)
+	}
+
+	// Procura por uma annotation que indique qual CFSpace controla este namespace
+	if annotations := k8sNamespace.GetAnnotations(); annotations != nil {
+		if spaceGUID, exists := annotations["korifi.cloudfoundry.org/space-guid"]; exists {
+			cfSpace := &korifiv1alpha1.CFSpace{}
+			err = r.client.Get(ctx, types.NamespacedName{Name: spaceGUID}, cfSpace)
+			if err == nil {
+				return cfSpace, nil
+			}
+		}
+	}
+
+	// Se não encontrou pela annotation, busca por label
+	if labels := k8sNamespace.GetLabels(); labels != nil {
+		if spaceGUID, exists := labels["korifi.cloudfoundry.org/space-guid"]; exists {
+			cfSpace := &korifiv1alpha1.CFSpace{}
+			err = r.client.Get(ctx, types.NamespacedName{Name: spaceGUID}, cfSpace)
+			if err == nil {
+				return cfSpace, nil
+			}
+		}
+	}
+
+	// Método 2: Buscar CFSpace com nome igual ao namespace
+	cfSpace := &korifiv1alpha1.CFSpace{}
+	err = r.client.Get(ctx, types.NamespacedName{Name: namespace}, cfSpace)
+	if err == nil {
+		return cfSpace, nil
+	}
+
+	// Método 3: Listar todos os CFSpaces e buscar correspondência
+	spaceList := &korifiv1alpha1.CFSpaceList{}
+	err = r.client.List(ctx, spaceList)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list CFSpaces: %w", err)
+	}
+
+	// Busca por correspondências no status ou padrões de nome
+	for i := range spaceList.Items {
+		space := &spaceList.Items[i]
+		
+		// Se o GUID do space corresponde ao namespace
+		if space.Status.GUID == namespace {
+			return space, nil
+		}
+		
+		// Se o namespace do space corresponde
+		if space.Namespace == namespace {
+			return space, nil
+		}
+		
+		// Se o namespace contém o displayName do space
+		if space.Spec.DisplayName != "" {
+			spaceName := sanitizeDNSLabel(space.Spec.DisplayName)
+			if strings.Contains(strings.ToLower(namespace), strings.ToLower(spaceName)) {
+				return space, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("CFSpace not found for namespace %s", namespace)
+}
+
+// getCFOrgForSpace encontra o CFOrg que corresponde ao CFSpace dado
+func (r *Reconciler) getCFOrgForSpace(ctx context.Context, cfSpace *korifiv1alpha1.CFSpace) (*korifiv1alpha1.CFOrg, error) {
+	// Método 1: Buscar por labels/annotations no space
+	if spaceLabels := cfSpace.GetLabels(); spaceLabels != nil {
+		if orgGUID, exists := spaceLabels["korifi.cloudfoundry.org/org-guid"]; exists {
+			cfOrg := &korifiv1alpha1.CFOrg{}
+			err := r.client.Get(ctx, types.NamespacedName{Name: orgGUID}, cfOrg)
+			if err == nil {
+				return cfOrg, nil
+			}
+		}
+	}
+
+	if spaceAnnotations := cfSpace.GetAnnotations(); spaceAnnotations != nil {
+		if orgGUID, exists := spaceAnnotations["korifi.cloudfoundry.org/org-guid"]; exists {
+			cfOrg := &korifiv1alpha1.CFOrg{}
+			err := r.client.Get(ctx, types.NamespacedName{Name: orgGUID}, cfOrg)
+			if err == nil {
+				return cfOrg, nil
+			}
+		}
+	}
+
+	// Método 2: Lista todas as orgs e procura pela que contém este space
+	orgList := &korifiv1alpha1.CFOrgList{}
+	err := r.client.List(ctx, orgList)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list CFOrgs: %w", err)
+	}
+
+	// Procura pela org usando diferentes estratégias
+	for i := range orgList.Items {
+		org := &orgList.Items[i]
+		
+		// Verifica se o space tem uma referência a esta org
+		if r.isSpaceBelongsToOrg(cfSpace, org) {
+			return org, nil
+		}
+	}
+
+	// Como fallback, retorna a primeira org encontrada (ajuste conforme necessário)
+	if len(orgList.Items) > 0 {
+		return &orgList.Items[0], nil
+	}
+
+	return nil, fmt.Errorf("CFOrg not found for CFSpace %s", cfSpace.Name)
+}
+
+// isSpaceBelongsToOrg verifica se um space pertence a uma org usando várias estratégias
+func (r *Reconciler) isSpaceBelongsToOrg(cfSpace *korifiv1alpha1.CFSpace, cfOrg *korifiv1alpha1.CFOrg) bool {
+	// Estratégia 1: Por prefixo de nome (ex: "org-space")
+	if strings.HasPrefix(strings.ToLower(cfSpace.Name), strings.ToLower(cfOrg.Name)+"-") {
+		return true
+	}
+	
+	// Estratégia 2: Por prefixo do displayName
+	if cfSpace.Spec.DisplayName != "" && cfOrg.Spec.DisplayName != "" {
+		if strings.HasPrefix(strings.ToLower(cfSpace.Spec.DisplayName), strings.ToLower(cfOrg.Spec.DisplayName)+"-") {
+			return true
+		}
+	}
+	
+	// Estratégia 3: Por namespace (se estão no mesmo namespace)
+	if cfSpace.Namespace == cfOrg.Namespace {
+		return true
+	}
+	
+	// Estratégia 4: Verificar se o GUID da org está em qualquer lugar do space
+	if cfOrg.Status.GUID != "" {
+		if strings.Contains(cfSpace.Name, cfOrg.Status.GUID) ||
+		   strings.Contains(cfSpace.Namespace, cfOrg.Status.GUID) {
+			return true
+		}
+	}
+	
+	return false
 }
 
 func (r *Reconciler) finalizeCFRoute(ctx context.Context, cfRoute *korifiv1alpha1.CFRoute) error {
@@ -288,8 +452,8 @@ func (r *Reconciler) getAppCurrentDroplet(ctx context.Context, appNamespace, app
 	return cfBuild.Status.Droplet, nil
 }
 
-func (r *Reconciler) reconcileHTTPRoute(ctx context.Context, cfRoute *korifiv1alpha1.CFRoute, cfDomain *korifiv1alpha1.CFDomain) error {
-	fqdn := buildFQDN(cfRoute, cfDomain)
+func (r *Reconciler) reconcileHTTPRoute(ctx context.Context, cfRoute *korifiv1alpha1.CFRoute, cfDomain *korifiv1alpha1.CFDomain, cfSpace *korifiv1alpha1.CFSpace, cfOrg *korifiv1alpha1.CFOrg) error {
+	fqdn := r.buildFQDN(cfRoute, cfDomain, cfSpace, cfOrg)
 	log := logr.FromContextOrDiscard(ctx).WithName("createOrPatchHTTPRoute").WithValues("fqdn", fqdn, "path", cfRoute.Spec.Path)
 
 	httpRoute := &gatewayv1beta1.HTTPRoute{
@@ -398,12 +562,58 @@ func (r *Reconciler) fetchServicesByMatchingLabels(ctx context.Context, labelSet
 	return &serviceList, nil
 }
 
-func generateServiceName(destination korifiv1alpha1.Destination) string {
-	return fmt.Sprintf("s-%s", destination.GUID)
+// buildFQDN constrói o FQDN da rota
+func (r *Reconciler) buildFQDN(cfRoute *korifiv1alpha1.CFRoute, cfDomain *korifiv1alpha1.CFDomain, cfSpace *korifiv1alpha1.CFSpace, cfOrg *korifiv1alpha1.CFOrg) string {
+	// Obter nomes efetivos
+	host := sanitizeDNSLabel(cfRoute.Spec.Host)
+	spaceName := sanitizeDNSLabel(getEffectiveName(cfSpace.Spec.DisplayName, cfSpace.Name))
+	orgName := sanitizeDNSLabel(getEffectiveName(cfOrg.Spec.DisplayName, cfOrg.Name))
+	
+	// Construir FQDN
+	return fmt.Sprintf("%s-%s-%s.%s", host, spaceName, orgName, cfDomain.Spec.Name)
 }
 
-func buildFQDN(cfRoute *korifiv1alpha1.CFRoute, cfDomain *korifiv1alpha1.CFDomain) string {
-	return fmt.Sprintf("%s.%s", strings.ToLower(cfRoute.Spec.Host), cfDomain.Spec.Name)
+// Funções auxiliares
+func getEffectiveName(displayName, name string) string {
+	if strings.TrimSpace(displayName) != "" {
+		return displayName
+	}
+	return name
+}
+
+func sanitizeDNSLabel(input string) string {
+	if input == "" {
+		return "default"
+	}
+	
+	result := strings.ToLower(input)
+	
+	// Remove caracteres inválidos para DNS
+	reg := regexp.MustCompile(`[^a-z0-9-]`)
+	result = reg.ReplaceAllString(result, "-")
+	
+	// Remove hífens consecutivos
+	reg = regexp.MustCompile(`-+`)
+	result = reg.ReplaceAllString(result, "-")
+	
+	// Remove hífens do início e fim
+	result = strings.Trim(result, "-")
+	
+	if result == "" {
+		result = "default"
+	}
+	
+	// Limita o comprimento (DNS labels têm limite de 63 caracteres)
+	if len(result) > 20 {
+		result = result[:20]
+		result = strings.TrimRight(result, "-")
+	}
+	
+	return result
+}
+
+func generateServiceName(destination korifiv1alpha1.Destination) string {
+	return fmt.Sprintf("s-%s", destination.GUID)
 }
 
 func toBackendRefs(destinations []korifiv1alpha1.Destination) []gatewayv1beta1.HTTPBackendRef {
