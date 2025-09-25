@@ -10,6 +10,7 @@ spec:
   sources:
   - image: paketobuildpacks/procfile
   - image: paketobuildpacks/go
+  - image: paketobuildpacks/nodejs
 ---
 apiVersion: kpack.io/v1alpha2
 kind: ClusterStack
@@ -42,3 +43,6 @@ spec:
     - id: paketo-buildpacks/procfile
   - group:
     - id: paketo-buildpacks/go
+  - group:
+    - id: paketo-buildpacks/nodejs
+
